@@ -1,6 +1,9 @@
 # Claude Code local (machine-specific permissions & paths)
 .claude/settings.local.json
 
+# Internal project notes (real IPs/hostnames/usernames) - keep local only
+CLAUDE.md
+
 # Script output
 sessions.csv
 *.csv
