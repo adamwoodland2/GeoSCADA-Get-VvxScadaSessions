@@ -1,0 +1,15 @@
+# Claude Code local (machine-specific permissions & paths)
+.claude/settings.local.json
+
+# Script output
+sessions.csv
+*.csv
+
+# Editor / OS cruft
+.vs/
+.vscode/
+*.suo
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store
