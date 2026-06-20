@@ -8,6 +8,9 @@ CLAUDE.md
 sessions.csv
 *.csv
 
+# Diagnostic reports from Get-VvxScadaSessions-Diag.ps1 (contain real IPs/hostnames/usernames)
+VvxScadaDiag_*.txt
+
 # Editor / OS cruft
 .vs/
 .vscode/

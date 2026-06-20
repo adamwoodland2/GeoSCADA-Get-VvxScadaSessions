@@ -67,6 +67,42 @@ each row.
 | `LocalViewXPID` | ViewX process id. |
 | `TargetScadaServer` | Geo SCADA server address(es). |
 
+## Diagnostics
+
+If the main script misbehaves — a session not matched, the wrong user resolved, or a slow run —
+`Get-VvxScadaSessions-Diag.ps1` collects everything needed to diagnose it into a single text report.
+It is **read-only** and needs no special tooling on the target box, so it can be run on a machine that
+cannot have developer tooling installed and the resulting report handed to someone who can analyse it.
+
+```powershell
+# Interactive: prompts to accept the disclaimer, then writes the report to the current directory.
+.\Get-VvxScadaSessions-Diag.ps1
+
+# Non-interactive: acceptance must be explicit. Collect inputs only (don't run the main script).
+.\Get-VvxScadaSessions-Diag.ps1 -AcceptDisclaimer -SkipRunMain -OutputPath C:\Temp\diag.txt
+```
+
+It mirrors the main script's parameters (`-ScadaPort`, `-ScadaServer`, `-ViewXProcessName`, `-LogRoot`,
+`-AuthLog`, `-AuthMatchWindowSeconds`, `-AcceptDisclaimer`) and adds `-MainScript`, `-OutputPath`,
+`-LogSampleLines` and `-SkipRunMain`. The report (timed per stage) includes:
+
+- environment / elevation / locale, and the main script's path + SHA-256;
+- live TCP connections to the SCADA port and their owning processes (ViewX vs the Thinfinity broker);
+- ViewX processes (PID / session / start / owner / command line);
+- raw `quser` and `qwinsta`;
+- a **raw recursive listing of the whole log root** (catches changed log filenames or folder layout),
+  plus per-session inventory and the relevant connect / logon / license lines;
+- a **port → log cross-reference** that mirrors the join and shows why each live port did or didn't
+  resolve;
+- the web-auth log, a locale parse check, and the timing-fallback prediction per process;
+- the main script's own output, `-Verbose` stream, errors and run time;
+- an automatic **"potential issues"** summary of common failure modes.
+
+> ⚠️ **The report contains real hostnames, usernames and IP addresses.** Review it and redact anything
+> sensitive before sharing — e.g. mask IP octets (`192.168.10.10` → `x.x.10.10`) and rename hosts/users
+> — keeping each replacement **consistent** so ports, users and GUIDs still line up across sections.
+> Generated reports (`VvxScadaDiag_*.txt`) are git-ignored.
+
 ## Disclaimer
 
 This script is provided **as-is, without warranty of any kind**, and is intended for diagnostic
