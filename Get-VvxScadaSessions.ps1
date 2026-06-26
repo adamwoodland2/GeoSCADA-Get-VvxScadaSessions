@@ -30,17 +30,24 @@
          (Get-NetTCPConnection + Get-Process / Win32_Process)
 
       2. PER-SESSION VIEWX LOG(S) (this box):
-         %ProgramData%\Schneider Electric\ClearSCADA\Logs\ViewX\Session_<N>\*SE.Scada.ViewX*log*
-         (ALL rolled logs in the folder are read, not just the active one.) Each connection block
-         is tagged with a run GUID (e.g. "Virtualized.<guid>") that appears on BOTH:
+         %ProgramData%\Schneider Electric\ClearSCADA\Logs\ViewX\...*SE.Scada.ViewX*log*
+         Two on-disk layouts are supported: a per-session subfolder (Session_<N>\, newer versions)
+         or flat files in the ViewX folder with the session number in the name (Geo SCADA 2023,
+         e.g. Virtualized_SE.Scada.ViewX_Session<N>.log).
+         (ALL rolled logs are read, not just the active one.) Each ViewX run tags its lines with a
+         per-run ANCHOR that appears on BOTH:
             "... Connected to <server>:5481 (from <localip>:<ephemeralport>)"
             "... Logon( IN: Username '<scadauser>' )"
+         The anchor has two forms by version: a run GUID (e.g. "Virtualized.<guid>", newer builds)
+         or, on 6.87 / Geo SCADA Expert 2025 which writes no GUID, the "[<hex>:<thread>]" run tag
+         (e.g. "[1FF0:12]") whose <hex> is shared by a run's Connected and Logon lines.
 
     This script joins the two: for each live ViewX connection it finds, across all rolled logs, the
-    MOST RECENT "(from ...:port)" line for that ephemeral port, takes its run GUID, and reads the
-    SCADA username from the Logon line under that same GUID. Anchoring on the GUID and "most recent
-    wins" ties the SCADA user to the exact live connection and is robust to ephemeral-port reuse,
-    Windows session-id reuse, and log rollover (rather than guessing by "most recent login").
+    MOST RECENT "(from ...:port)" line for that ephemeral port, takes its run anchor (GUID, else run
+    tag), and reads the SCADA username from the Logon line under that same anchor. Anchoring this way
+    plus "most recent wins" ties the SCADA user to the exact live connection and is robust to
+    ephemeral-port reuse, Windows session-id reuse, and log rollover (rather than guessing by "most
+    recent login").
 
     If a session's ViewX was license-rejected before it ever authenticated, its log has no Logon
     line and the port join yields nothing. As a fallback the script then infers the typed SCADA
@@ -243,20 +250,27 @@ function Get-ProcessOwner {
 
 # From a session's ViewX log(s), find the SCADA username for a given set of LIVE ephemeral ports.
 #
-# Each ViewX run tags every line with a connection-block GUID (e.g. "Virtualized.<guid>"); that same
-# GUID appears on both the "Connected ... (from <ip>:<port>)" lines and the "Logon( IN: Username ... )"
-# lines for that run. A reconnect, a reused Windows session, or a different SCADA login each get a NEW
-# GUID. The GUID is therefore the join anchor.
+# Each ViewX run tags every line with a per-run ANCHOR that appears on both the
+# "Connected ... (from <ip>:<port>)" lines and the "Logon( IN: Username ... )" lines for that run.
+# A reconnect, a reused Windows session, or a different SCADA login each get a NEW anchor, so the
+# anchor is the join key. Two anchor styles exist depending on the ViewX/Geo SCADA version:
+#   * GUID    : newer builds tag a connection-block GUID (e.g. "Virtualized.<guid>").
+#   * run tag : 6.87 / Geo SCADA Expert 2025 has NO GUID; it tags every line "[<hex>:<thread>]"
+#               (e.g. "[1FF0:12]") and shares the <hex> run id between a run's Connected and Logon
+#               lines. We take the leftmost "[<hex>:<hex>]" bracket as the run id.
+# Per line we prefer the GUID and fall back to the run tag, so the SAME logic resolves both versions.
 #
 # Rollover- and reuse-safe strategy (single chronological pass over ALL rolled logs, oldest->newest):
-#   * For each live port, the MOST RECENT "(from ...:port)" line wins -> its GUID is the live block.
+#   * For each live port, the MOST RECENT "(from ...:port)" line wins -> its anchor is the live run.
 #     "Most recent wins" is what defeats reuse: an OS won't reassign a source port that is still
-#     ESTABLISHED, so no newer line can claim a live port; and older blocks left in a reused Session_N
+#     ESTABLISHED, so no newer line can claim a live port; and older runs left in a reused Session_N
 #     folder (Windows session-id reuse) or older connections that recycled the same port number are,
-#     by definition, older -> they lose. This holds even if the live block's connect line has already
+#     by definition, older -> they lose. This holds even if the live run's connect line has already
 #     rolled into an archived file, because all rolled files are read.
-#   * The user is the Logon recorded under THAT GUID -> keeps a SCADA user who has logged into several
-#     different sessions correctly separated per session.
+#   * The user is the Logon recorded under THAT anchor -> keeps a SCADA user who has logged into
+#     several different sessions correctly separated per session. (GUIDs are globally unique; run-tag
+#     hex is only per-run and could in theory recur via PID reuse, but most-recent-wins + the fact
+#     that a live ESTABLISHED port cannot belong to an older run keeps the live match correct.)
 #   * Fallback (ports not in any log: rolled fully away or low verbosity) = most recent Logon overall.
 #     This is NOT port-anchored and can be wrong after reuse; it is flagged via Write-Verbose.
 function Resolve-ScadaUserFromLog {
@@ -272,35 +286,38 @@ function Resolve-ScadaUserFromLog {
         Sort-Object LastWriteTime
     if (-not $files) { return $null }
 
-    $guidRegex  = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
-    $logonRegex = "Logon\(\s*IN:\s*Username\s*'([^']+)'"
-    $portSet    = @{}
+    $guidRegex   = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+    $runTagRegex = '\[([0-9A-Fa-f]+):[0-9A-Fa-f]+\]'   # leftmost "[<hex>:<thread>]" -> run id (no-GUID builds)
+    $logonRegex  = "Logon\(\s*IN:\s*Username\s*'([^']+)'"
+    $portSet     = @{}
     foreach ($p in $Ports) { $portSet["$p"] = $true }
 
-    $liveGuid     = $null    # GUID of the block currently owning a live port (most recent wins)
-    $guidToUser   = @{}      # GUID -> most recent Logon username seen under it
+    $liveAnchor   = $null    # anchor (GUID or run tag) of the run currently owning a live port (most recent wins)
+    $anchorToUser = @{}      # anchor -> most recent Logon username seen under it
     $lastFileUser = $null    # most recent Logon anywhere (fallback only)
 
     foreach ($f in $files) {
         try { $lines = Get-Content -LiteralPath $f.FullName -ErrorAction Stop } catch { continue }
         foreach ($line in $lines) {
-            # Capture the block GUID first; later -match calls overwrite $matches.
-            $guid = $null
-            if ($line -match $guidRegex) { $guid = $matches[1] }
+            # Capture the per-run anchor first (GUID preferred, else run tag); later -match calls
+            # overwrite $matches. Normalise hex case so a run's connect and Logon lines key identically.
+            $anchor = $null
+            if     ($line -match $guidRegex)   { $anchor = $matches[1].ToUpperInvariant() }
+            elseif ($line -match $runTagRegex) { $anchor = $matches[1].ToUpperInvariant() }
 
             if ($line -match $logonRegex) {
                 $lastFileUser = $matches[1]
-                if ($guid) { $guidToUser[$guid] = $matches[1] }
+                if ($anchor) { $anchorToUser[$anchor] = $matches[1] }
             }
             elseif ($line -match 'from\s+\S+:(\d+)\)') {
-                if ($guid -and $portSet.ContainsKey($matches[1])) { $liveGuid = $guid }
+                if ($anchor -and $portSet.ContainsKey($matches[1])) { $liveAnchor = $anchor }
             }
         }
     }
 
-    # Primary: port-anchored user for the live block.
-    if ($liveGuid -and $guidToUser.ContainsKey($liveGuid)) {
-        return $guidToUser[$liveGuid]
+    # Primary: port-anchored user for the live run.
+    if ($liveAnchor -and $anchorToUser.ContainsKey($liveAnchor)) {
+        return $anchorToUser[$liveAnchor]
     }
 
     # Fallback: no live port found in any log.
@@ -416,15 +433,28 @@ $results = foreach ($g in ($viewxConns | Group-Object PID)) {
     if (-not $winUser)   { $winUser   = '(unknown)' }
     if (-not $runAsUser) { $runAsUser = '(unknown - run elevated)' }
 
-    # SCADA user from the per-session log(s). Read ALL rolled logs in the folder (active + archived)
-    # so a long-lived connection whose connect/logon lines have rolled into an older file still resolves.
-    # The roll naming for ViewX is unknown/version-specific, so match generically: any file under the
-    # Session_<N> folder whose name contains 'SE.Scada.ViewX' and 'log' (catches '.log', '.log.1',
-    # '.log.bak', 'SE.Scada.ViewX_<date>.log', 'Virtualized_' prefix, etc.).
+    # SCADA user from the per-session log(s). Read ALL rolled logs (active + archived) so a long-lived
+    # connection whose connect/logon lines have rolled into an older file still resolves. The roll naming
+    # for ViewX is unknown/version-specific, so match generically: any file whose name contains
+    # 'SE.Scada.ViewX' and 'log' (catches '.log', '.log.1', '.log.bak', 'SE.Scada.ViewX_<date>.log',
+    # 'Virtualized_' prefix, '_Session<N>.<roll>.log', etc.).
+    #
+    # Two on-disk layouts exist depending on the Geo SCADA version:
+    #   * Newer: one subfolder per Windows session, $LogRoot\Session_<SessionId>\...
+    #   * Geo SCADA 2023: flat files directly in $LogRoot, session number encoded in the FILENAME
+    #     (e.g. 'SE.Scada.ViewX_Session2.log', 'Virtualized_SE.Scada.ViewX_Session1671.1.log').
+    # When there is no per-session subfolder we read every ViewX log in $LogRoot; the authoritative
+    # join is the port->GUID anchor (not the folder/filename), so reading the full set is correct.
     $logFiles = @()
     $sessFolder = Join-Path $LogRoot ("Session_{0}" -f $sessionId)
     if (Test-Path $sessFolder) {
         $logFiles = Get-ChildItem -LiteralPath $sessFolder -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' } |
+                    Select-Object -ExpandProperty FullName
+    }
+    elseif (Test-Path $LogRoot) {
+        # Flat (Geo SCADA 2023) layout: no Session_<N> subfolder, logs live directly in $LogRoot.
+        $logFiles = Get-ChildItem -LiteralPath $LogRoot -File -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' } |
                     Select-Object -ExpandProperty FullName
     }

@@ -202,10 +202,18 @@ function Invoke-Section {
     Write-Host ("  - {0,-34} {1,7} ms" -f $Title, $ms)
 }
 
-$GuidRegex  = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
-$LogonRegex = "Logon\(\s*IN:\s*Username\s*'([^']+)'"
+$GuidRegex   = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+$RunTagRegex = '\[([0-9A-Fa-f]+):[0-9A-Fa-f]+\]'   # leftmost "[<hex>:<thread>]" run tag (no-GUID builds)
+$LogonRegex  = "Logon\(\s*IN:\s*Username\s*'([^']+)'"
 
-function Get-LineGuid { param([string]$Line) ; if ($Line -match $GuidRegex) { return $matches[1] } ; return '' }
+# Per-run join anchor for a line, mirroring the MAIN script: prefer a GUID, else the "[<hex>:<thread>]"
+# run tag (6.87 / Geo SCADA Expert 2025 writes no GUID). Returns '' if neither is present.
+function Get-LineAnchor {
+    param([string]$Line)
+    if ($Line -match $GuidRegex)   { return $matches[1].ToUpperInvariant() }
+    if ($Line -match $RunTagRegex) { return $matches[1].ToUpperInvariant() }
+    return ''
+}
 
 # Fast, lock-tolerant log reader. PowerShell's Get-Content is slow (per-line decoration); use .NET.
 # Opens with FileShare.ReadWrite so it can read a log ViewX currently has open for writing.
@@ -227,6 +235,134 @@ function Get-SessionLogFiles {
     if (-not (Test-Path -LiteralPath $Folder)) { return @() }
     Get-ChildItem -LiteralPath $Folder -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' }
+}
+
+# Candidate ViewX log files for a given Windows SessionId, mirroring the MAIN script's selection
+# across both on-disk layouts:
+#   * per-session subfolder : LogRoot\Session_<N>\*SE.Scada.ViewX*log*   (newer versions)
+#   * flat (Geo SCADA 2023) : *SE.Scada.ViewX*log* directly in LogRoot   (session number in filename)
+# In the flat case the main script reads ALL ViewX logs (the port->GUID anchor, not the folder,
+# disambiguates), so the diagnostic must return the same full set to stay an accurate mirror.
+function Get-ViewXLogFiles {
+    param([int]$SessionId)
+    $folder = Join-Path $LogRoot ("Session_{0}" -f $SessionId)
+    if (Test-Path -LiteralPath $folder) { return @(Get-SessionLogFiles -Folder $folder) }
+    if (Test-Path -LiteralPath $LogRoot) {
+        return @(Get-ChildItem -LiteralPath $LogRoot -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' })
+    }
+    return @()
+}
+
+# FileVersionInfo for an on-disk file (no elevation needed to read version info of a readable file).
+function Get-FileVersionInfoSafe {
+    param([string]$Path)
+    try {
+        if ($Path -and (Test-Path -LiteralPath $Path)) {
+            return [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+        }
+    } catch { }
+    return $null
+}
+
+# ViewX product/version from the per-run startup banner each ViewX writes near the top of its log, e.g.
+#   Product           : EcoStruxure Geo SCADA Expert 2025 Build 6.87.9552.1 (X86 Release)
+#   Starting:  EcoStruxure Geo SCADA Expert 2025
+#   Version:   6.87.9552.1
+# Returns distinct {File, Product, Version} (newest files first). Reads each file only until it has
+# both fields (capped) - logs are large, the banner is near the start of each run.
+function Get-ViewXLogVersions {
+    param([object[]]$Files)
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen  = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($f in (@($Files) | Sort-Object LastWriteTime -Descending)) {
+        $product = $null; $version = $null
+        try {
+            $fs = [System.IO.File]::Open($f.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $sr = New-Object System.IO.StreamReader($fs)
+            $n = 0
+            while (-not $sr.EndOfStream -and $n -lt 20000) {
+                $line = $sr.ReadLine(); $n++
+                if (-not $product -and $line -match 'Product\s*:\s*(.+?)\s*$')         { $product = $matches[1].Trim() }
+                if (-not $product -and $line -match 'Starting:\s*(.+?)\s*$')           { $product = $matches[1].Trim() }
+                if (-not $version -and $line -match 'Version:\s*([0-9]+(?:\.[0-9]+)+)') { $version = $matches[1] }
+                if ($product -and $version) { break }
+            }
+            $sr.Close(); $fs.Close()
+        } catch { }
+        if ($product -or $version) {
+            $key = "$product|$version"
+            if ($seen.Add($key)) {
+                $found.Add([PSCustomObject]@{ File = $f.Name; Product = $product; Version = $version; LastWrite = $f.LastWriteTime })
+            }
+        }
+    }
+    return $found
+}
+
+# Inventory + relevant-line analysis for ONE set of ViewX log files (a Session_<N> folder, or the
+# flat LogRoot set). Reads each rolled file once, then reports byte/line inventory, distinct run
+# GUIDs, connect/Logon/license-reject counts and sample lines, and raises the same triage issues.
+# $Label is only a heading. Used by section 6 for both layouts so the evidence is identical either way.
+function Show-LogFileSetAnalysis {
+    param([string]$Label, [object[]]$Files)
+    $Files = @($Files)
+    if (-not $Files) { Add-Line ("  (no files match '*SE.Scada.ViewX*log*' for {0})" -f $Label) ; return }
+
+    # Read each rolled file ONCE (oldest->newest): inventory AND keep the lines for filtering below.
+    $totalBytes = 0; $totalLines = 0
+    $lines = New-Object System.Collections.Generic.List[string]
+    $inv = foreach ($f in ($Files | Sort-Object LastWriteTime)) {
+        $content = @(Read-LogLines -Path $f.FullName)
+        $lc = $content.Count
+        $totalBytes += $f.Length; $totalLines += $lc
+        if ($lc -gt 0) { $lines.AddRange([string[]]$content) }
+        [PSCustomObject]@{ Name=$f.Name; Bytes=$f.Length; Lines=$lc; LastWrite=$f.LastWriteTime }
+    }
+    $inv | Format-Table -AutoSize | Out-String
+    Add-Line ("  rolled files: {0}   total: {1:N0} bytes, {2:N0} lines" -f ($Files|Measure-Object).Count, $totalBytes, $totalLines)
+    if ($totalBytes -gt 50MB) { Add-Issue ("{0}: {1:N0} bytes of ViewX logs are read in full on every run -> a likely cause of slow runs." -f $Label, $totalBytes) }
+
+    # Classify in ONE plain foreach pass (avoids ~5 pipeline passes over what can be 100k+ lines).
+    # Track BOTH anchor styles the main script understands: GUIDs and "[<hex>:<thread>]" run tags.
+    $connect   = New-Object System.Collections.Generic.List[string]
+    $logons    = New-Object System.Collections.Generic.List[string]
+    $license   = New-Object System.Collections.Generic.List[string]
+    $guidSet   = New-Object System.Collections.Generic.HashSet[string]
+    $runTagSet = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($line in $lines) {
+        if ($line -match 'from\s+\S+:\d+\)') { $connect.Add($line) }
+        if ($line -match $LogonRegex)        { $logons.Add($line) }
+        if ($line -match 'Client License Rejected|C014006A|SCX_E_NO_LICENCE') { $license.Add($line) }
+        if ($line -match $GuidRegex)         { [void]$guidSet.Add($matches[1].ToUpperInvariant()) }
+        elseif ($line -match $RunTagRegex)   { [void]$runTagSet.Add($matches[1].ToUpperInvariant()) }
+    }
+
+    Add-Line ("  distinct run GUIDs: {0}   distinct run tags '[hex:..]': {1}   connect-from lines: {2}   Logon lines: {3}   license-reject lines: {4}" -f $guidSet.Count, $runTagSet.Count, $connect.Count, $logons.Count, $license.Count)
+    if ($guidSet.Count -eq 0 -and $runTagSet.Count -gt 0 -and ($connect.Count -gt 0 -or $logons.Count -gt 0)) {
+        Add-Line ("  (no GUID anchors; this build tags lines '[<hex>:<thread>]' - the main script's dual-anchor join uses the '[<hex>:' run tag here.)")
+    }
+    if ($guidSet.Count -eq 0 -and $runTagSet.Count -eq 0 -and ($connect.Count -gt 0 -or $logons.Count -gt 0)) {
+        Add-Issue ("{0}: connect/Logon lines exist but NEITHER a GUID nor a '[<hex>:<thread>]' run tag was found on any line -> the main script's port->user join has no anchor to key on and will fall back to 'most recent Logon in the folder' (unreliable). The log line format has likely changed; capture a sample." -f $Label)
+    }
+    if ($logons.Count -eq 0 -and $license.Count -gt 0) {
+        Add-Issue ("{0}: has license-rejection lines and NO Logon line -> classic license-rejected session; SCADA user only resolvable via web-auth timing fallback." -f $Label)
+    }
+    if ($logons.Count -eq 0 -and $license.Count -eq 0 -and $connect.Count -gt 0) {
+        Add-Issue ("{0}: has connect lines but NO Logon line and NO license rejection -> low log verbosity? The ViewX-log join will fail here." -f $Label)
+    }
+
+    Add-Line ''
+    Add-Line ("  last {0} connect-from lines:" -f $LogSampleLines)
+    ($connect | Select-Object -Last $LogSampleLines | ForEach-Object { "    $_" }) -join "`n"
+    Add-Line ''
+    Add-Line ("  last {0} Logon lines:" -f $LogSampleLines)
+    ($logons | Select-Object -Last $LogSampleLines | ForEach-Object { "    $_" }) -join "`n"
+    if ($license.Count -gt 0) {
+        Add-Line ''
+        Add-Line "  last 10 license-reject lines:"
+        ($license | Select-Object -Last 10 | ForEach-Object { "    $_" }) -join "`n"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -378,20 +514,88 @@ Invoke-Section 'ViewX processes (PID / Session / start / owner / cmdline)' {
             if ($o.ReturnValue -eq 0) { $owner = "$($o.Domain)\$($o.User)" } else { $owner = "(GetOwner rc=$($o.ReturnValue))" }
         } catch { $owner = '(GetOwner failed - needs admin for cross-session)' }
         [PSCustomObject]@{
-            PID        = $p.ProcessId
-            SessionId  = $p.SessionId
-            StartTime  = $p.CreationDate
-            RunAsOwner = $owner
-            CommandLine= $p.CommandLine
+            PID            = $p.ProcessId
+            SessionId      = $p.SessionId
+            StartTime      = $p.CreationDate
+            RunAsOwner     = $owner
+            ExecutablePath = $p.ExecutablePath   # blank cross-session without elevation
+            CommandLine    = $p.CommandLine
         } | Format-List | Out-String
     }
 
-    # ViewX whose SessionId has no Session_<N> log folder = guaranteed unresolved from logs.
+    # ViewX whose SessionId yields no readable ViewX log in EITHER layout = guaranteed unresolved from logs.
     foreach ($p in $script:ViewXProcs) {
-        $folder = Join-Path $LogRoot ("Session_{0}" -f $p.SessionId)
-        if (-not (Test-Path -LiteralPath $folder)) {
-            Add-Issue ("ViewX PID {0} is in SessionId {1} but '{2}' does not exist -> its SCADA user can't come from a ViewX log (auth-timing fallback only)." -f $p.ProcessId, $p.SessionId, $folder)
+        if (-not (Get-ViewXLogFiles -SessionId $p.SessionId)) {
+            $folder = Join-Path $LogRoot ("Session_{0}" -f $p.SessionId)
+            Add-Issue ("ViewX PID {0} is in SessionId {1} but no ViewX log files were found (neither '{2}\' nor flat in LogRoot) -> its SCADA user can't come from a ViewX log (auth-timing fallback only)." -f $p.ProcessId, $p.SessionId, $folder)
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4b. ViewX version (from the exe and from the log startup banner)
+# ---------------------------------------------------------------------------
+# Records WHICH ViewX/Geo SCADA build produced this report, so behaviour that is version-specific
+# (log line format, GUID vs '[hex:thread]' run tags, folder layout) can be tied to a known version.
+# Two independent sources, reported and cross-checked:
+#   * the exe's FileVersionInfo (authoritative for the installed binary)
+#   * the 'Product/Version' startup banner inside the ViewX log (what actually ran, per session)
+Invoke-Section 'ViewX version (exe + log banner)' {
+    # ----- (a) exe FileVersionInfo -----
+    Add-Line "----- exe version (FileVersionInfo) -----"
+    $exePaths = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($script:ViewXProcs)) { if ($p.ExecutablePath) { [void]$exePaths.Add($p.ExecutablePath) } }
+    # Common default install locations (probed only if the live process path was blank/unelevated).
+    foreach ($pp in @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Schneider Electric\ClearSCADA\SE.Scada.ViewX.exe'),
+        (Join-Path $env:ProgramFiles        'Schneider Electric\ClearSCADA\SE.Scada.ViewX.exe')
+    )) { if ($pp -and (Test-Path -LiteralPath $pp)) { [void]$exePaths.Add($pp) } }
+    $exePaths = @($exePaths | Select-Object -Unique)
+
+    $exeVersion = $null
+    if (-not $exePaths) {
+        Add-Line "  No ViewX exe path resolved (process ExecutablePath is blank without elevation, and the exe"
+        Add-Line "  was not at a probed default install path). Pass an explicit path or run elevated; the log"
+        Add-Line "  banner below still provides the version."
+    } else {
+        foreach ($ep in $exePaths) {
+            $vi = Get-FileVersionInfoSafe -Path $ep
+            if ($vi) {
+                if (-not $exeVersion) { $exeVersion = $vi.ProductVersion }
+                [PSCustomObject]@{
+                    Path           = $ep
+                    ProductName    = $vi.ProductName
+                    ProductVersion = $vi.ProductVersion
+                    FileVersion    = $vi.FileVersion
+                } | Format-List | Out-String
+            } else {
+                Add-Line "  (could not read version info for: $ep)"
+            }
+        }
+    }
+
+    # ----- (b) log startup banner -----
+    Add-Line ''
+    Add-Line "----- log banner version (Product / Version line each ViewX writes at startup) -----"
+    $allLogs = @()
+    if (Test-Path -LiteralPath $LogRoot) {
+        $allLogs = @(Get-ChildItem -LiteralPath $LogRoot -Recurse -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' })
+    }
+    $logVersions = @(Get-ViewXLogVersions -Files $allLogs)
+    if (-not $logVersions) {
+        Add-Line "  (no Product/Version startup banner found in any ViewX log)"
+    } else {
+        ($logVersions | Format-Table -AutoSize | Out-String)
+        if ($logVersions.Count -gt 1) {
+            Add-Issue ("More than one ViewX version appears across the logs ({0}) - the box was likely upgraded; older sessions/logs may differ from the running build." -f (($logVersions | ForEach-Object { $_.Version }) -join ', '))
+        }
+    }
+
+    # ----- cross-check exe vs log -----
+    $logVer = if ($logVersions) { $logVersions[0].Version } else { $null }
+    if ($exeVersion -and $logVer -and ($exeVersion -notlike "*$logVer*") -and ($logVer -notlike "*$exeVersion*")) {
+        Add-Issue ("ViewX exe version ('{0}') differs from the newest log-banner version ('{1}') - upgraded since the logs were written, or the probed exe is not the one that ran." -f $exeVersion, $logVer)
     }
 }
 
@@ -415,10 +619,11 @@ Invoke-Section 'ViewX log tree (raw) + inventory & lines' {
     if (-not (Test-Path -LiteralPath $LogRoot)) { Add-Line "LogRoot does not exist: $LogRoot" ; return }
 
     # ----- RAW recursive listing of EVERYTHING under LogRoot -----
-    # The main script only reads LogRoot\Session_<N>\*SE.Scada.ViewX*log* (one level deep). Both the
-    # FILE NAMES and the FOLDER STRUCTURE have changed across ViewX versions, so dump the whole tree
-    # verbatim - independent of any glob/convention - to reveal future naming/layout changes that would
-    # silently break the join (a changed name/path just looks like "no logs" otherwise).
+    # The main script reads LogRoot\Session_<N>\*SE.Scada.ViewX*log* (newer) OR flat *SE.Scada.ViewX*log*
+    # directly in LogRoot (Geo SCADA 2023). Both the FILE NAMES and the FOLDER STRUCTURE have changed
+    # across ViewX versions, so dump the whole tree verbatim - independent of any glob/convention - to
+    # reveal further naming/layout changes that would silently break the join (a changed name/path just
+    # looks like "no logs" otherwise).
     Add-Line "----- RAW recursive listing of LogRoot (independent of any naming/structure assumption) -----"
     Add-Line "LogRoot: $LogRoot"
     $rootLen  = $LogRoot.TrimEnd('\').Length + 1
@@ -448,81 +653,56 @@ Invoke-Section 'ViewX log tree (raw) + inventory & lines' {
         Add-Issue "Log-like files under LogRoot are NOT matched by the glob '*SE.Scada.ViewX*log*' (filenames may have changed) - the main script would skip them. See the RAW listing."
     }
 
-    # (b) Matched files NOT directly in LogRoot\Session_<N> (exactly 2 path segments) -> structure change.
-    $matchedOutside = @($globMatched | Where-Object {
+    # (b) The main script reads TWO layouts: LogRoot\Session_<N>\* (newer) and flat *.* directly in
+    #     LogRoot (Geo SCADA 2023). Flat files (1 path segment) are supported; anything in any OTHER
+    #     location (deeper nesting / different subfolders) it would still miss.
+    $matchedFlat  = @($globMatched | Where-Object { (($_.FullName.Substring($rootLen)) -split '\\').Count -eq 1 })
+    $matchedOther = @($globMatched | Where-Object {
         $parts = $_.FullName.Substring($rootLen) -split '\\'
-        -not ($parts.Count -eq 2 -and $parts[0] -like 'Session_*')
+        -not (($parts.Count -eq 1) -or ($parts.Count -eq 2 -and $parts[0] -like 'Session_*'))
     })
-    if ($matchedOutside.Count -gt 0) {
+    if ($matchedFlat.Count -gt 0) {
         Add-Line ''
-        Add-Line "  POSSIBLE STRUCTURE CHANGE - ViewX log files NOT directly under LogRoot\Session_<N>:"
-        ($matchedOutside | Select-Object @{n='RelPath';e={ $_.FullName.Substring($rootLen) }}, Length, LastWriteTime | Format-Table -AutoSize | Out-String)
-        Add-Issue "ViewX log files exist OUTSIDE LogRoot\Session_<N>\ (folder structure may have changed) - the main script only reads one level under Session_<N>, so it would miss these."
+        Add-Line ("  Flat-layout ViewX logs directly in LogRoot (Geo SCADA 2023 style, supported): {0} file(s)." -f $matchedFlat.Count)
+    }
+    if ($matchedOther.Count -gt 0) {
+        Add-Line ''
+        Add-Line "  POSSIBLE STRUCTURE CHANGE - ViewX log files in an UNRECOGNISED location (neither LogRoot\Session_<N>\ nor flat in LogRoot):"
+        ($matchedOther | Select-Object @{n='RelPath';e={ $_.FullName.Substring($rootLen) }}, Length, LastWriteTime | Format-Table -AutoSize | Out-String)
+        Add-Issue "ViewX log files exist in an unrecognised location (not LogRoot\Session_<N>\ and not flat in LogRoot) - the main script reads only those two layouts, so it would miss these."
     }
 
     $sessionFolders = Get-ChildItem -LiteralPath $LogRoot -Directory -Filter 'Session_*' -ErrorAction SilentlyContinue | Sort-Object Name
-    if (-not $sessionFolders) { Add-Line '' ; Add-Line "No Session_* folders under $LogRoot (see RAW listing above for the actual layout)." ; Add-Issue "No Session_* folders under LogRoot - the join expects LogRoot\Session_<N>\. Folder convention may have changed; check the RAW listing." ; return }
-
-    foreach ($sf in $sessionFolders) {
-        Add-Line ''
-        Add-Line ("----- {0} -----" -f $sf.Name)
-        $files = Get-SessionLogFiles -Folder $sf.FullName
-        if (-not $files) {
-            Add-Line "  (no files match '*SE.Scada.ViewX*log*'; ALL items in this folder:)"
-            $other = @(Get-ChildItem -LiteralPath $sf.FullName -Force -ErrorAction SilentlyContinue)
-            if ($other) {
-                ($other | Select-Object @{n='Name';e={ if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name } }}, Length, LastWriteTime | Sort-Object Name | Format-Table -AutoSize | Out-String)
-            } else { Add-Line "    (folder is empty)" }
-            continue
-        }
-
-        # Read each rolled file ONCE (oldest->newest): get the line count AND keep the lines for the
-        # relevant-line filtering below. (Inventory + content in a single pass per file.)
-        $totalBytes = 0; $totalLines = 0
-        $lines = New-Object System.Collections.Generic.List[string]
-        $inv = foreach ($f in ($files | Sort-Object LastWriteTime)) {
-            $content = @(Read-LogLines -Path $f.FullName)
-            $lc = $content.Count
-            $totalBytes += $f.Length; $totalLines += $lc
-            if ($lc -gt 0) { $lines.AddRange([string[]]$content) }
-            [PSCustomObject]@{ Name=$f.Name; Bytes=$f.Length; Lines=$lc; LastWrite=$f.LastWriteTime }
-        }
-        $inv | Format-Table -AutoSize | Out-String
-        Add-Line ("  rolled files: {0}   total: {1:N0} bytes, {2:N0} lines" -f ($files|Measure-Object).Count, $totalBytes, $totalLines)
-        if ($totalBytes -gt 50MB) { Add-Issue ("{0}: {1:N0} bytes of ViewX logs are read in full on every run -> a likely cause of slow runs." -f $sf.Name, $totalBytes) }
-
-        # Classify in ONE plain foreach pass (avoids ~5 pipeline passes + per-line function calls over
-        # what can be 100k+ lines). Inline regex; no Where-Object/ForEach-Object overhead.
-        $connect = New-Object System.Collections.Generic.List[string]
-        $logons  = New-Object System.Collections.Generic.List[string]
-        $license = New-Object System.Collections.Generic.List[string]
-        $guidSet = New-Object System.Collections.Generic.HashSet[string]
-        foreach ($line in $lines) {
-            if ($line -match 'from\s+\S+:\d+\)') { $connect.Add($line) }
-            if ($line -match $LogonRegex)        { $logons.Add($line) }
-            if ($line -match 'Client License Rejected|C014006A|SCX_E_NO_LICENCE') { $license.Add($line) }
-            if ($line -match $GuidRegex)         { [void]$guidSet.Add($matches[1]) }
-        }
-
-        Add-Line ("  distinct run GUIDs: {0}   connect-from lines: {1}   Logon lines: {2}   license-reject lines: {3}" -f $guidSet.Count, $connect.Count, $logons.Count, $license.Count)
-
-        if ($logons.Count -eq 0 -and $license.Count -gt 0) {
-            Add-Issue ("{0}: has license-rejection lines and NO Logon line -> classic license-rejected session; SCADA user only resolvable via web-auth timing fallback." -f $sf.Name)
-        }
-        if ($logons.Count -eq 0 -and $license.Count -eq 0 -and $connect.Count -gt 0) {
-            Add-Issue ("{0}: has connect lines but NO Logon line and NO license rejection -> low log verbosity? The ViewX-log join will fail here." -f $sf.Name)
-        }
-
-        Add-Line ''
-        Add-Line ("  last {0} connect-from lines:" -f $LogSampleLines)
-        ($connect | Select-Object -Last $LogSampleLines | ForEach-Object { "    $_" }) -join "`n"
-        Add-Line ''
-        Add-Line ("  last {0} Logon lines:" -f $LogSampleLines)
-        ($logons | Select-Object -Last $LogSampleLines | ForEach-Object { "    $_" }) -join "`n"
-        if ($license.Count -gt 0) {
+    if ($sessionFolders) {
+        # Newer layout: one subfolder per Windows session.
+        foreach ($sf in $sessionFolders) {
             Add-Line ''
-            Add-Line "  last 10 license-reject lines:"
-            ($license | Select-Object -Last 10 | ForEach-Object { "    $_" }) -join "`n"
+            Add-Line ("----- {0} -----" -f $sf.Name)
+            $files = Get-SessionLogFiles -Folder $sf.FullName
+            if (-not $files) {
+                Add-Line "  (no files match '*SE.Scada.ViewX*log*'; ALL items in this folder:)"
+                $other = @(Get-ChildItem -LiteralPath $sf.FullName -Force -ErrorAction SilentlyContinue)
+                if ($other) {
+                    ($other | Select-Object @{n='Name';e={ if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name } }}, Length, LastWriteTime | Sort-Object Name | Format-Table -AutoSize | Out-String)
+                } else { Add-Line "    (folder is empty)" }
+                continue
+            }
+            Show-LogFileSetAnalysis -Label $sf.Name -Files $files
+        }
+    } else {
+        # Flat (Geo SCADA 2023) layout: no Session_<N> subfolders; the logs sit directly in LogRoot with
+        # the session number in the filename, and the main script reads them as one set (port-anchored).
+        $flat = @(Get-ChildItem -LiteralPath $LogRoot -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like '*SE.Scada.ViewX*log*' })
+        if ($flat) {
+            Add-Line ''
+            Add-Line "----- flat layout: all '*SE.Scada.ViewX*log*' directly in LogRoot (no Session_<N> subfolders) -----"
+            Add-Line "(Geo SCADA 2023 style; the main script reads these directly and anchors on the ephemeral port.)"
+            Show-LogFileSetAnalysis -Label '(flat LogRoot)' -Files $flat
+        } else {
+            Add-Line ''
+            Add-Line "No Session_* folders AND no '*SE.Scada.ViewX*log*' files directly under $LogRoot (see RAW listing above)."
+            Add-Issue "No ViewX logs found under LogRoot in either layout (Session_<N>\ or flat) - the ViewX-log join cannot work. Wrong -LogRoot, logging disabled, or naming changed; check the RAW listing."
         }
     }
 }
@@ -540,41 +720,42 @@ Invoke-Section 'Port -> log cross-reference (join mirror)' {
         Add-Line ''
         Add-Line ("port {0}  (PID {1}, SessionId {2})" -f $port, $lv.PID, $sessionId)
 
-        $files = Get-SessionLogFiles -Folder $folder
-        if (-not $files) { Add-Line "    no log files in $folder -> NO MATCH (would use auth-timing fallback)" ; continue }
+        $files = Get-ViewXLogFiles -SessionId $sessionId
+        if (-not $files) { Add-Line ("    no ViewX log files for SessionId {0} (looked in '{1}\' and flat in LogRoot) -> NO MATCH (would use auth-timing fallback)" -f $sessionId, $folder) ; continue }
 
         # Find the most-recent '(from ...:port)' across all rolled files (oldest->newest, last wins).
-        $bestGuid = ''; $bestFile = ''; $hitCount = 0
+        # Anchor on the GUID if present, else the '[<hex>:<thread>]' run tag - same as the main script.
+        $bestAnchor = ''; $bestFile = ''; $hitCount = 0
         foreach ($f in ($files | Sort-Object LastWriteTime)) {
             $ls = Read-LogLines -Path $f.FullName
             foreach ($line in $ls) {
                 if ($line -match ("from\s+\S+:{0}\)" -f $port)) {
                     $hitCount++
-                    $g = Get-LineGuid $line
-                    if ($g) { $bestGuid = $g; $bestFile = $f.Name }
+                    $a = Get-LineAnchor $line
+                    if ($a) { $bestAnchor = $a; $bestFile = $f.Name }
                 }
             }
         }
 
-        if (-not $bestGuid) {
-            Add-Line "    matches: $hitCount   -> NO GUID-anchored match (port not found in logs) -> auth-timing fallback"
+        if (-not $bestAnchor) {
+            Add-Line "    matches: $hitCount   -> NO anchor-keyed match (port not found in logs) -> auth-timing fallback"
             Add-Issue ("port {0} (SessionId {1}) not found in any ViewX log -> resolved only via web-auth timing (or unresolved). Rolled away or low verbosity?" -f $port, $sessionId)
             continue
         }
 
-        # Most-recent Logon under that GUID = the user the main script would report.
+        # Most-recent Logon under that anchor = the user the main script would report.
         $user = ''
         foreach ($f in ($files | Sort-Object LastWriteTime)) {
             $ls = Read-LogLines -Path $f.FullName
             foreach ($line in $ls) {
-                if ((Get-LineGuid $line) -eq $bestGuid -and $line -match $LogonRegex) { $user = $matches[1] }
+                if ((Get-LineAnchor $line) -eq $bestAnchor -and $line -match $LogonRegex) { $user = $matches[1] }
             }
         }
         Add-Line ("    matches: {0}   newest in: {1}" -f $hitCount, $bestFile)
-        Add-Line ("    run GUID: {0}" -f $bestGuid)
-        Add-Line ("    resolved ScadaUser: {0}" -f $(if ($user) { "'$user' (source: ViewX log)" } else { '(GUID found but NO Logon under it -> license-rejected? auth-timing fallback)' }))
+        Add-Line ("    run anchor (GUID or '[hex:..]' tag): {0}" -f $bestAnchor)
+        Add-Line ("    resolved ScadaUser: {0}" -f $(if ($user) { "'$user' (source: ViewX log)" } else { '(anchor found but NO Logon under it -> license-rejected? auth-timing fallback)' }))
         if (-not $user) {
-            Add-Issue ("port {0} (SessionId {1}) matched run GUID {2} but that GUID has no Logon line -> license-rejected; needs web-auth timing." -f $port, $sessionId, $bestGuid)
+            Add-Issue ("port {0} (SessionId {1}) matched run anchor {2} but that anchor has no Logon line -> license-rejected; needs web-auth timing." -f $port, $sessionId, $bestAnchor)
         }
     }
 }
